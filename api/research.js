@@ -16,7 +16,13 @@ async function redis(...command) {
   if (body.error) throw new Error('Shared cache unavailable');
   return body.result;
 }
-const cacheKey = name => `tst:v1:person:${name.normalize('NFKC').toLocaleLowerCase('en-US').replace(/\s+/g,' ').trim()}`;
+const cacheKey = name => `tst:v2:person:${name.normalize('NFKC').toLocaleLowerCase('en-US').replace(/\s+/g,' ').trim()}`;
+async function recordRecent(name) {
+  try {
+    await redis('ZADD', 'tst:v1:recent', Date.now(), name);
+    await redis('EXPIRE', 'tst:v1:recent', 604800);
+  } catch (error) { console.error('Recent search tracking failed', error?.message); }
+}
 const parseSaved = raw => {try {return raw ? JSON.parse(raw) : null;}catch{return null;}};
 
 export default async function handler(req, res) {
@@ -29,21 +35,21 @@ export default async function handler(req, res) {
   let ownsLock = false;
   try {
     const existing = parseSaved(await redis('GET', key));
-    if (existing) return res.status(200).json({...existing, cached:true});
+    if (existing) { await recordRecent(existing.analysis?.name || name); return res.status(200).json({...existing, cached:true}); }
     // Only one deployment can acquire this lock for a given person.
     ownsLock = (await redis('SET', lockKey, 'working', 'NX', 'EX', 90)) === 'OK';
     if (!ownsLock) {
       for (let i=0; i<22; i++) {
         await wait(2000);
         const saved = parseSaved(await redis('GET', key));
-        if (saved) return res.status(200).json({...saved, cached:true});
+        if (saved) { await recordRecent(saved.analysis?.name || name); return res.status(200).json({...saved, cached:true}); }
         if (!(await redis('GET', lockKey))) break;
       }
       return res.status(202).json({pending:true,message:'This person is already being researched. Please search again in a moment.'});
     }
     // Check again after obtaining the lock in case a previous request just completed.
     const secondCheck = parseSaved(await redis('GET', key));
-    if (secondCheck) return res.status(200).json({...secondCheck, cached:true});
+    if (secondCheck) { await recordRecent(secondCheck.analysis?.name || name); return res.status(200).json({...secondCheck, cached:true}); }
     if (!process.env.OPENAI_API_KEY) return res.status(503).json({error:'Research is not configured yet. Set OPENAI_API_KEY in Vercel.'});
   } catch (err) {
     console.error('Cache failed', err?.message);
@@ -60,8 +66,8 @@ export default async function handler(req, res) {
         model:process.env.OPENAI_MODEL || 'gpt-5.4-mini',
         tools:[{type:'web_search',search_context_size:'medium'}],
         tool_choice:'required',
-        max_output_tokens:2200,
-        instructions:`You are an evidence-conscious cultural ethics researcher. Search the live web for this well-known public figure. Never conflate people with the same name. If identity is ambiguous, or insufficient reliable evidence, set both scores null and explain. Do not invent sources or events. Separate verified conduct from allegations, and avoid stating allegations as fact. Give exactly 5 concise bullet strings for contributions and exactly 5 for ethics when evidence supports them, otherwise fewer and say evidence is insufficient. Be balanced about documented beneficial actions and harms. Scores 0-100 are transparent subjective editorial estimates, NOT objective moral worth; null if evidence is insufficient. Avoid basing moral judgments on protected traits, beliefs, identity, or rumors. Evaluate potential consequences of buying, sharing, studying, criticizing, or financially supporting the person's work, including living/deceased distinctions. Write a contextual philosophical reflection discussing how attention can legitimize harm or enable good, without presuming all engagement is endorsement. Cite credible web evidence in your reasoning. Return ONLY a JSON object with keys: name,identity,confidence (high/medium/low),contributionScore,ethicsScore,contributions (array of strings),ethics (array of strings),verdictTitle,verdict,reflection. Plain text JSON, no markdown.`,
+        max_output_tokens:4300,
+        instructions:`You research public figures across art, technology, culture and other fields. Search the web. Never confuse same-name people. Avoid invented or defamatory assertions; label allegations as disputed and do not use anonymous rumors as established facts. Distinguish conduct from creative influence. Do not treat ordinary commercial success, popularity, or business expansion as misconduct. The six evidence categories are culturalGood, culturalNeutral, culturalBad, ethicalGood, ethicalNeutral, ethicalBad. Search actively for each category, but return [] if no reliable, relevant findings; do not fabricate a positive/negative to achieve balance. Cultural categories describe the work and its impacts; ethical categories describe documented actions and accountability. Each finding MUST be a short OBJECT {"text":"one factual sentence without URLs or markdown", "sourceIds":[1,2]} with 1 or more source IDs referring to the sources array. Avoid repetitive findings and excessive corporate PR sources; seek independent reputable coverage. Include up to 4 distinct meaningful findings per category, fewer when evidence is thin. Sources array: [{"id":1,"title":"readable title","url":"https://..."}] using actual pages discovered in search, no guessed URLs. Cite each finding by sourceIds. If you cannot cite a finding to an actual discovered source, omit it. Include contributionReason and ethicsReason: 1-2 sentences EACH explaining exactly what evidence drives the score and limitations; no unsourced claims. Scores are subjective 0-100 editorial assessments, not morality, and should be null if too little evidence; avoid false precision or forced middle scores. An ethics score does NOT require positive actions if documented conduct supports an assessment; explain this explicitly rather than implying that lack of negative reports proves virtue. Avoid scoring protected identity or political beliefs. communityDiscussions: [] or up to 3 short descriptions of PUBLIC online discussion THEMES, not personal allegations, without impact on scores. Consider consequences of studying vs financially supporting someone's work. Return ONLY one valid JSON object with keys name,identity,confidence (high/medium/low),contributionScore,ethicsScore,contributionReason,ethicsReason,culturalGood,culturalNeutral,culturalBad,ethicalGood,ethicalNeutral,ethicalBad,sources,communityDiscussions,verdictTitle,verdict,reflection. No markdown or URLs embedded in finding text.`,
         input:`Research the public figure named: ${name}`
       })
     });}finally{clearTimeout(timeout);}
@@ -72,13 +78,52 @@ export default async function handler(req, res) {
     const raw=content.map(x=>x.text||'').join('').trim().replace(/^```(?:json)?\s*/,'').replace(/\s*```$/,'');
     let analysis;
     try {analysis=JSON.parse(raw);}catch {return res.status(502).json({error:'Research returned an incomplete result. Please try again.'});}
-    const urls=new Map();
-    for(const c of content) for(const a of (c.annotations||[])) if(a.type==='url_citation' && /^https?:\/\//.test(a.url||''))urls.set(a.url,{title:a.title||a.url,url:a.url});
-    // Never treat model-written URLs as independently verified citations.
-    const record = {analysis,sources:[...urls.values()].slice(0,20),researchedAt:new Date().toISOString()};
+    // Only keep source URLs with valid HTTPS links. Model-provided references are
+    // presented transparently, not claimed to be independently verified.
+    const supplied = Array.isArray(analysis.sources) ? analysis.sources : [];
+    const cleanSources = [];
+    const ids = new Map();
+    for (const source of supplied) {
+      if (cleanSources.length >= 24) break;
+      if (!source || typeof source.url !== 'string') continue;
+      let url;
+      try { url = new URL(source.url); } catch { continue; }
+      if (url.protocol !== 'https:' || url.username || url.password) continue;
+      const id = Number(source.id);
+      if (!Number.isSafeInteger(id) || ids.has(id)) continue;
+      ids.set(id, cleanSources.length + 1);
+      cleanSources.push({title:String(source.title || url.hostname).slice(0,180),url:url.href});
+    }
+    const categories = ['culturalGood','culturalNeutral','culturalBad','ethicalGood','ethicalNeutral','ethicalBad'];
+    for (const category of categories) {
+      const values = Array.isArray(analysis[category]) ? analysis[category] : [];
+      analysis[category] = values.map(item => {
+        if (!item || typeof item !== 'object') return null;
+        const sourceIds = [...new Set((Array.isArray(item.sourceIds)?item.sourceIds:[]).map(id => ids.get(Number(id))).filter(Boolean))];
+        const text = typeof item.text === 'string' ? item.text.trim() : '';
+        return text && sourceIds.length ? {text:text.slice(0,450),sourceIds} : null;
+      }).filter(Boolean).slice(0,4);
+    }
+    // Do not show numeric assessments without evidence and a rationale.
+    const hasCultural = ['culturalGood','culturalNeutral','culturalBad'].some(k => analysis[k].length);
+    const hasEthical = ['ethicalGood','ethicalNeutral','ethicalBad'].some(k => analysis[k].length);
+    for (const [scoreKey,reasonKey,hasEvidence] of [
+      ['contributionScore','contributionReason',hasCultural],
+      ['ethicsScore','ethicsReason',hasEthical]
+    ]) {
+      const score = analysis[scoreKey];
+      if (!hasEvidence || typeof analysis[reasonKey] !== 'string' || !analysis[reasonKey].trim() ||
+          score === null || score === undefined || score === '' || !Number.isFinite(Number(score))) {
+        analysis[scoreKey] = null;
+        analysis[reasonKey] = 'Insufficient sourced evidence to explain a reliable assessment.';
+      } else analysis[scoreKey] = Math.round(Math.max(0,Math.min(100,Number(score))));
+    }
+    delete analysis.sources;
+    const record = {analysis,sources:cleanSources,researchedAt:new Date().toISOString()};
     // Save before returning; if storage fails, don't imply everyone will see identical results.
     try { await redis('SET', key, JSON.stringify(record), 'EX', DAY_SECONDS); }
     catch(err) { console.error('Cache save failed',err?.message); return res.status(503).json({error:'Research completed but could not be saved. Please try later.'}); }
+    await recordRecent(analysis.name || name);
     return res.status(200).json({...record,cached:false});
   }catch(err){console.error('Research failed',err?.message);return res.status(502).json({error:'Research timed out or failed. Please try again.'});}
   finally { if (ownsLock) { try { await redis('DEL',lockKey); } catch(err) { console.error('Lock cleanup failed',err?.message); } } }
